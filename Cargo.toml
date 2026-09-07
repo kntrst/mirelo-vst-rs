@@ -3,4 +3,36 @@ name = "mirelo-vst-rs"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "mirelo-vst-rs-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+[features]
+default = ["vst3", "standalone"]
+vst3 = ["dep:truce-vst3"]
+standalone = ["dep:truce-standalone"]
+shell = ["truce/shell"]
+# Flags any allocation your DSP makes on the audio thread in `process`.
+# Dev/test only: `cargo test --features rt-paranoid`. Off, zero-cost by
+# default.
+rt-paranoid = ["truce/rt-paranoid"]
+
 [dependencies]
+truce = { version = "6.3" }
+truce-gui-types = { version = "6.3" }
+truce-gui = { version = "6.3" }
+truce-vst3 = { version = "6.3", optional = true }
+truce-standalone = { version = "6.3", features = ["gui"], optional = true }
+
+# Custom profile for `cargo truce install --shell`. The shell-mode
+# build (`cargo build --profile shell --features ...,shell`) lands the
+# shell binary at `target/shell/lib<crate>.dylib`, independent of
+# `target/release/` (where regular `cargo build --release` writes) and
+# `target/debug/` (where `cargo build` writes). Inherits release for
+# DSP perf parity.
+[profile.shell]
+inherits = "release"

@@ -1,0 +1,20 @@
+[vendor]
+name = "Oliver Gaede"
+id = "com.ogaede"
+url = "https://localhost"
+au_manufacturer = "MCom"
+
+[[plugin]]
+name = "MireloVstRs"
+bundle_id = "mirelo-vst-rs"
+crate = "mirelo-vst-rs"
+category = "effect"
+fourcc = "Plug"
+au_tag = "Effects"
+# VST3 secondary subcategory — drives the Cubase myplugin submenu.
+# Tighten to your effect kind: "Delay", "Distortion", "Dynamics",
+# "EQ", "Filter", "Mastering", "Modulation", "Pitch Shift",
+# "Reverb", "Surround", "Analyzer", "Spatial". Leave as "Tools" for
+# generic utilities. Without this, Cubase buckets the myplugin under
+# "Other".
+vst3_subcategory = "Tools"
