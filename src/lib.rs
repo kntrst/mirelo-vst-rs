@@ -1,4 +1,5 @@
 pub mod mirelo;
+use crate::mirelo::service::HttpService;
 
 use std::sync::Arc;
 use truce::prelude::*;
@@ -15,7 +16,7 @@ pub struct MireloVstRsParams {
     /// Editor/worker-only state. Truce does not persist or automate this
     /// field, but every editor for this plugin instance receives the same Arc.
     #[skip]
-    pub http: Arc<mirelo::sync_api::HttpService>,
+    pub http: Arc<HttpService>,
 }
 
 // The plugin struct is its own DSP state (`type DspState = Self`). The
@@ -43,7 +44,7 @@ impl MireloVstRs {
     /// Receives a fully-downloaded result through bounded lock-free queues.
     /// Every value that cannot yet be returned stays in DSP state, so this
     /// path never drops a file allocation on the audio thread.
-    fn receive_downloaded_files(&mut self, http: &mirelo::sync_api::HttpService) {
+    fn receive_downloaded_files(&mut self, http: &HttpService) {
         self.return_retired_files(http);
         if self.retiring_files.is_some() {
             return;
@@ -55,7 +56,7 @@ impl MireloVstRs {
         }
     }
 
-    fn return_retired_files(&mut self, http: &mirelo::sync_api::HttpService) {
+    fn return_retired_files(&mut self, http: &HttpService) {
         let Some(files) = self.retiring_files.take() else {
             return;
         };
