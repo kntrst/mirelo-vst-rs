@@ -1077,6 +1077,7 @@ dependencies = [
 name = "mirelo-vst-rs"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "egui",
  "serde",
  "serde_json",

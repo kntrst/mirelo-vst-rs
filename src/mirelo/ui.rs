@@ -95,14 +95,11 @@ fn response_status(response: Response) -> String {
             estimate.credits(),
             estimate.estimated_ms()
         ),
-        Response::Submit(Ok(files)) => {
-            let urls = files.result_urls();
-            if urls.is_empty() {
-                "Mirelo returned no result URLs.".to_owned()
-            } else {
-                format!("Generated {} file(s):\n{}", urls.len(), urls.join("\n"))
-            }
-        }
+        Response::Submit(Ok(report)) => format!(
+            "Downloaded {} file(s) into audio memory ({} bytes).",
+            report.file_count(),
+            report.total_bytes()
+        ),
         Response::PreflightCheck(Err(error)) | Response::Submit(Err(error)) => {
             format!("Request failed: {error}")
         }

@@ -29,6 +29,7 @@ truce-vst3 = { version = "6.3", optional = true }
 truce-standalone = { version = "6.3", features = ["gui"], optional = true }
 
 egui = "0.34"
+crossbeam-queue = "0.3.14"
 ureq = "3.4.1"
 serde_json = "1.0.151"
 serde = "1.0.229"

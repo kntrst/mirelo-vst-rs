@@ -1,14 +1,17 @@
+use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 const PREFLIGHT_URL: &str = "https://api.mirelo.ai/v2/text-to-sfx/v1.6/preflight";
 const SUBMIT_URL: &str = "https://api.mirelo.ai/v2/text-to-sfx/v1.6/sync";
+const MAX_DOWNLOADED_AUDIO_FILE_BYTES: u64 = 50 * 1024 * 1024;
+const WORKER_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// All failures that cross from the HTTP worker to the editor are rendered as
 /// text. The worker must never panic just because the service rejected a
@@ -130,15 +133,63 @@ pub struct Files {
     result_urls: Vec<String>,
 }
 
-impl Files {
-    pub fn result_urls(&self) -> &[String] {
-        &self.result_urls
+/// One downloaded audio file. The worker fills this off-thread; the audio
+/// callback only receives its ownership and never reads from the network.
+#[allow(dead_code)] // Consumed by the upcoming MIDI playback implementation.
+pub(crate) struct InMemoryAudioFile {
+    source_url: String,
+    bytes: Vec<u8>,
+}
+
+#[allow(dead_code)] // Consumed by the upcoming MIDI playback implementation.
+impl InMemoryAudioFile {
+    pub(crate) fn source_url(&self) -> &str {
+        &self.source_url
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// The complete result of one Mirelo generation. These are encoded audio
+/// bytes for now; decoding into playback-ready sample buffers comes with MIDI
+/// playback support.
+#[allow(dead_code)] // Consumed by the upcoming MIDI playback implementation.
+pub(crate) struct InMemoryAudioFiles {
+    files: Vec<InMemoryAudioFile>,
+    total_bytes: usize,
+}
+
+#[allow(dead_code)] // Consumed by the upcoming MIDI playback implementation.
+impl InMemoryAudioFiles {
+    pub(crate) fn files(&self) -> &[InMemoryAudioFile] {
+        &self.files
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
+
+pub struct DownloadReport {
+    file_count: usize,
+    total_bytes: usize,
+}
+
+impl DownloadReport {
+    pub fn file_count(&self) -> usize {
+        self.file_count
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
     }
 }
 
 pub enum Response {
     PreflightCheck(Result<CostEstimate, ApiError>),
-    Submit(Result<Files, ApiError>),
+    Submit(Result<DownloadReport, ApiError>),
     WorkerStopped,
 }
 
@@ -150,6 +201,8 @@ pub struct HttpService {
     response_rx: Mutex<Option<Receiver<Response>>>,
     start_lock: Mutex<()>,
     busy: AtomicBool,
+    ready_files: Arc<ArrayQueue<InMemoryAudioFiles>>,
+    returned_files: Arc<ArrayQueue<InMemoryAudioFiles>>,
 }
 
 impl Default for HttpService {
@@ -159,6 +212,10 @@ impl Default for HttpService {
             response_rx: Mutex::new(None),
             start_lock: Mutex::new(()),
             busy: AtomicBool::new(false),
+            // One generation can be waiting for the audio callback while the
+            // previous generation is returned for worker-thread destruction.
+            ready_files: Arc::new(ArrayQueue::new(1)),
+            returned_files: Arc::new(ArrayQueue::new(1)),
         }
     }
 }
@@ -182,9 +239,11 @@ impl HttpService {
 
         let (request_tx, request_rx) = mpsc::sync_channel(1);
         let (response_tx, response_rx) = mpsc::channel();
+        let ready_files = Arc::clone(&self.ready_files);
+        let returned_files = Arc::clone(&self.returned_files);
         thread::Builder::new()
             .name("mirelo-http".to_owned())
-            .spawn(move || worker_loop(request_rx, response_tx))
+            .spawn(move || worker_loop(request_rx, response_tx, ready_files, returned_files))
             .map_err(|error| ApiError::new(format!("could not start HTTP worker: {error}")))?;
 
         let _ = self.request_tx.set(request_tx);
@@ -247,6 +306,19 @@ impl HttpService {
             }
         }
     }
+
+    /// Audio-thread side of the worker-to-audio handoff. `ArrayQueue::pop`
+    /// uses no allocation or mutex.
+    pub(crate) fn take_ready_files(&self) -> Option<InMemoryAudioFiles> {
+        self.ready_files.pop()
+    }
+
+    /// Return an old audio buffer to the worker so its Vec allocation is
+    /// released off the audio thread. The caller retains the value when the
+    /// preallocated queue is temporarily full.
+    pub(crate) fn return_files(&self, files: InMemoryAudioFiles) -> Result<(), InMemoryAudioFiles> {
+        self.returned_files.push(files)
+    }
 }
 
 impl Api {
@@ -275,6 +347,32 @@ impl Api {
         self.post(SUBMIT_URL, prompt)
     }
 
+    fn submit_and_download(&self, prompt: Prompt) -> Result<InMemoryAudioFiles, ApiError> {
+        let files = self.submit(prompt)?;
+        let mut downloaded = Vec::with_capacity(files.result_urls.len());
+        let mut total_bytes: usize = 0;
+
+        for source_url in files.result_urls {
+            let bytes = self
+                .agent
+                .get(&source_url)
+                .call()?
+                .body_mut()
+                .with_config()
+                .limit(MAX_DOWNLOADED_AUDIO_FILE_BYTES)
+                .read_to_vec()?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| ApiError::new("downloaded audio is too large to hold in memory"))?;
+            downloaded.push(InMemoryAudioFile { source_url, bytes });
+        }
+
+        Ok(InMemoryAudioFiles {
+            files: downloaded,
+            total_bytes,
+        })
+    }
+
     fn post<T: for<'de> Deserialize<'de>>(
         &self,
         url: &str,
@@ -293,16 +391,41 @@ impl Api {
     }
 }
 
-fn worker_loop(request_rx: Receiver<Request>, response_tx: mpsc::Sender<Response>) {
+fn worker_loop(
+    request_rx: Receiver<Request>,
+    response_tx: mpsc::Sender<Response>,
+    ready_files: Arc<ArrayQueue<InMemoryAudioFiles>>,
+    returned_files: Arc<ArrayQueue<InMemoryAudioFiles>>,
+) {
     // The agent and its connection pool belong solely to this thread.
     let api = Api::new();
-    while let Ok(request) = request_rx.recv() {
+    loop {
+        // Vec destruction is deliberately kept on this worker, not on the
+        // real-time callback that previously owned a completed generation.
+        while returned_files.pop().is_some() {}
+
+        let request = match request_rx.recv_timeout(WORKER_WAKE_INTERVAL) {
+            Ok(request) => request,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let response = match request {
-            Request::Submit(prompt) => Response::Submit(
-                api.as_ref()
+            Request::Submit(prompt) => {
+                let result = api
+                    .as_ref()
                     .map_err(Clone::clone)
-                    .and_then(|api| api.submit(prompt)),
-            ),
+                    .and_then(|api| api.submit_and_download(prompt));
+                Response::Submit(result.map(|files| {
+                    let report = DownloadReport {
+                        file_count: files.files.len(),
+                        total_bytes: files.total_bytes,
+                    };
+                    // If the audio callback has not consumed a previous
+                    // result, replace it here. This drop is worker-thread-only.
+                    drop(ready_files.force_push(files));
+                    report
+                }))
+            }
             Request::PreflightCheck(prompt) => Response::PreflightCheck(
                 api.as_ref()
                     .map_err(Clone::clone)
