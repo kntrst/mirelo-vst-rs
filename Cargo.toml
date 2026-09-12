@@ -22,11 +22,17 @@ shell = ["truce/shell"]
 rt-paranoid = ["truce/rt-paranoid"]
 
 [dependencies]
+# Truce dependencies
 truce = { version = "6.3" }
 truce-gui-types = { version = "6.3" }
 truce-gui = { version = "6.3" }
 truce-vst3 = { version = "6.3", optional = true }
 truce-standalone = { version = "6.3", features = ["gui"], optional = true }
+
+
+ureq = "3.4.1"
+serde_json = "1.0.151"
+serde = "1.0.229"
 
 # Custom profile for `cargo truce install --shell`. The shell-mode
 # build (`cargo build --profile shell --features ...,shell`) lands the
