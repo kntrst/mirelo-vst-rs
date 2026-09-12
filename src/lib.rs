@@ -1,7 +1,7 @@
-pub mod mirelo; 
+pub mod mirelo;
 
+use std::sync::Arc;
 use truce::prelude::*;
-use truce_gui_types::layout::{GridLayout, knob, widgets};
 
 #[derive(Params)]
 pub struct MireloVstRsParams {
@@ -12,9 +12,11 @@ pub struct MireloVstRsParams {
         smooth = "exp(5)"
     )]
     pub gain: FloatParam,
+    /// Editor/worker-only state. Truce does not persist or automate this
+    /// field, but every editor for this plugin instance receives the same Arc.
+    #[skip]
+    pub http: Arc<mirelo::sync_api::HttpService>,
 }
-
-use MireloVstRsParamsParamId as P;
 
 // The plugin struct is its own DSP state (`type DspState = Self`). The
 // shell owns it and preserves it across a hot-reload, so a code-only
@@ -28,6 +30,13 @@ pub struct MireloVstRs {
 impl PluginLogic for MireloVstRs {
     type Params = MireloVstRsParams;
     type DspState = Self;
+
+    fn init(params: &Self::Params, _context: &InitContext) -> Self::DspState {
+        // Truce calls init off the audio thread. Starting the worker here keeps
+        // agent setup and every later HTTP operation out of process().
+        let _ = params.http.start();
+        Self::default()
+    }
 
     fn process(
         _state: &mut Self::DspState,
@@ -47,10 +56,8 @@ impl PluginLogic for MireloVstRs {
     }
 
     fn editor(params: Arc<MireloVstRsParams>) -> Box<dyn Editor> {
-        truce_gui::default_editor(
-            params,
-            GridLayout::build(vec![widgets(vec![knob(P::Gain, "Gain")])]),
-        )
+        truce_egui::EguiEditor::with_ui(params, (560, 400), mirelo::ui::MireloUi::default())
+            .into_editor()
     }
 }
 
