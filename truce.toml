@@ -1,20 +1,20 @@
 [vendor]
-name = "Oliver Gaede"
-id = "com.ogaede"
-url = "https://localhost"
-au_manufacturer = "MCom"
+name = "Mirelo"
+id = "ai.mirelo"
+url = "https://example.com"
+au_manufacturer = "Mire"
 
 [[plugin]]
 name = "MireloVstRs"
 bundle_id = "mirelo-vst-rs"
 crate = "mirelo-vst-rs"
-category = "effect"
-fourcc = "Plug"
-au_tag = "Effects"
-# VST3 secondary subcategory — drives the Cubase myplugin submenu.
+category = "instrument"
+fourcc = "MVRs"
+au_tag = "Synthesizer"
+# VST3 secondary subcategory — drives the Cubase plugin submenu.
 # Tighten to your effect kind: "Delay", "Distortion", "Dynamics",
 # "EQ", "Filter", "Mastering", "Modulation", "Pitch Shift",
 # "Reverb", "Surround", "Analyzer", "Spatial". Leave as "Tools" for
-# generic utilities. Without this, Cubase buckets the myplugin under
+# generic utilities. Without this, Cubase buckets the plugin under
 # "Other".
-vst3_subcategory = "Tools"
+vst3_subcategory = "Synth"

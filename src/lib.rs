@@ -1,8 +1,20 @@
-pub mod mirelo;
-use crate::mirelo::service::HttpService;
+mod config;
+mod decode;
+mod editor;
+mod mirelo;
+mod player;
+mod shared;
+mod worker;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
 use truce::prelude::*;
+
+use player::Voice;
+use shared::{Command, Inner, AudioClip, Shared, SharedString};
+
+const GRAVEYARD_SIZE: usize = 16;
+pub const DEFAULT_DURATION_MS: u32 = 1000;
 
 #[derive(Params)]
 pub struct MireloVstRsParams {
@@ -13,91 +25,153 @@ pub struct MireloVstRsParams {
         smooth = "exp(5)"
     )]
     pub gain: FloatParam,
-    /// Editor/worker-only state. Truce does not persist or automate this
-    /// field, but every editor for this plugin instance receives the same Arc.
+
+    #[persist]
+    pub prompt: Mutex<String>,
+    #[persist]
+    pub duration_ms: Mutex<u32>,
+    #[persist]
+    pub last_file: SharedString,
+
     #[skip]
-    pub http: Arc<HttpService>,
+    pub shared: Shared,
 }
 
-// The plugin struct is its own DSP state (`type DspState = Self`). The
-// shell owns it and preserves it across a hot-reload, so a code-only
-// reload keeps reverb tails and oscillator phase alive.
-pub struct MireloVstRs {
-    /// Latest encoded files available to the audio callback. MIDI playback
-    /// will later decode/use these without involving the HTTP worker.
-    audio_files: Option<mirelo::sync_api::InMemoryAudioFiles>,
-    /// An older generation waiting to be returned to the worker for drop.
-    /// This prevents a potentially large Vec deallocation in `process`.
-    retiring_files: Option<mirelo::sync_api::InMemoryAudioFiles>,
-}
-
-impl Default for MireloVstRs {
-    fn default() -> Self {
-        Self {
-            audio_files: None,
-            retiring_files: None,
-        }
+impl MireloVstRsParams {
+    fn start_worker(&self) {
+        self.shared.ensure_worker(&self.last_file);
     }
 }
 
-impl MireloVstRs {
-    /// Receives a fully-downloaded result through bounded lock-free queues.
-    /// Every value that cannot yet be returned stays in DSP state, so this
-    /// path never drops a file allocation on the audio thread.
-    fn receive_downloaded_files(&mut self, http: &HttpService) {
-        self.return_retired_files(http);
-        if self.retiring_files.is_some() {
-            return;
-        }
+/// owned by audio thread
+#[derive(Default)]
+pub struct Dsp {
+    inner: Option<Arc<Inner>>,
+    graveyard: Option<rtrb::Producer<Arc<AudioClip>>>,
+    current: Option<Arc<AudioClip>>,
+    voice: Voice,
+    host_rate: f64,
+}
 
-        if let Some(files) = http.take_ready_files() {
-            self.retiring_files = self.audio_files.replace(files);
-            self.return_retired_files(http);
-        }
-    }
-
-    fn return_retired_files(&mut self, http: &HttpService) {
-        let Some(files) = self.retiring_files.take() else {
-            return;
+impl Dsp {
+    fn sync_sample(&mut self) {
+        let Some(inner) = &self.inner else { return };
+        let latest = inner.sample.load();
+        let same = match (&*latest, &self.current) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
         };
-        if let Err(files) = http.return_files(files) {
-            self.retiring_files = Some(files);
+        if same {
+            return;
         }
+        let new = (*latest).clone();
+        drop(latest);
+        if let Some(old) = std::mem::replace(&mut self.current, new) {
+            let retired = match self.graveyard.as_mut() {
+                Some(g) => g.push(old).err().map(|rtrb::PushError::Full(o)| o),
+                None => Some(old),
+            };
+            if let Some(o) = retired {
+                std::mem::forget(o);
+            }
+        }
+        self.voice.stop();
     }
 }
+
+pub struct MireloVstRs;
 
 impl PluginLogic for MireloVstRs {
     type Params = MireloVstRsParams;
-    type DspState = Self;
+    type DspState = Dsp;
 
-    fn init(params: &Self::Params, _context: &InitContext) -> Self::DspState {
-        // Truce calls init off the audio thread. Starting the worker here keeps
-        // agent setup and every later HTTP operation out of process().
-        let _ = params.http.start();
-        Self::default()
+    fn bus_layouts() -> Vec<BusLayout> {
+        vec![BusLayout::new().with_output("Main", ChannelConfig::Stereo)]
+    }
+
+    fn init(params: &Self::Params, _cx: &InitContext) -> Self::DspState {
+        params.start_worker();
+        let (producer, consumer) = rtrb::RingBuffer::new(GRAVEYARD_SIZE);
+        let inner = params.shared.inner.clone();
+        if let Ok(mut g) = inner.graveyard.lock() {
+            *g = Some(consumer);
+        }
+        params.shared.send(Command::Reload);
+        Dsp {
+            inner: Some(inner),
+            graveyard: Some(producer),
+            host_rate: 48_000.0,
+            ..Default::default()
+        }
+    }
+
+    fn reset(state: &mut Self::DspState, _params: &Self::Params, config: &AudioConfig) {
+        state.host_rate = config.sample_rate;
+        state.voice.stop();
+    }
+
+    fn state_changed(_state: &mut Self::DspState, params: &Self::Params) {
+        params.shared.send(Command::Reload);
     }
 
     fn process(
         state: &mut Self::DspState,
         params: &Self::Params,
         buffer: &mut AudioBuffer,
-        _events: &EventList,
+        events: &EventList,
         _context: &mut ProcessContext,
     ) -> ProcessStatus {
-        state.receive_downloaded_files(&params.http);
-        for i in 0..buffer.num_samples() {
-            let gain = db_to_linear(params.gain.read());
-            for ch in 0..buffer.channels() {
-                let (inp, out) = buffer.io(ch);
-                out[i] = inp[i] * gain;
-            }
+        state.sync_sample();
+
+        let n = buffer.num_samples();
+        let n_out = buffer.num_output_channels();
+        for ch in 0..n_out {
+            buffer.output(ch)[..n].fill(0.0);
         }
+
+        let step = state
+            .current
+            .as_ref()
+            .map_or(1.0, |s| s.sample_rate / state.host_rate.max(1.0));
+        let mut gain = || db_to_linear(params.gain.read());
+        let mut cursor = 0usize;
+        let Dsp { current, voice, .. } = state;
+
+        let mut render_to = |voice: &mut Voice, end: usize, buffer: &mut AudioBuffer| {
+            let end = end.min(n);
+            if end > cursor {
+                voice.render(
+                    current.as_ref(),
+                    step,
+                    n_out,
+                    cursor,
+                    end - cursor,
+                    &mut gain,
+                    &mut |ch, i, v| buffer.output(ch)[i] += v,
+                );
+                cursor = end;
+            }
+        };
+
+        // any note-on (any channel / note) retriggers
+        for event in events.iter() {
+            let velocity = match event.body {
+                EventBody::NoteOn { velocity, .. } if velocity > 0 => f32::from(velocity) / 127.0,
+                EventBody::NoteOn2 { velocity, .. } if velocity > 0 => {
+                    f32::from(velocity) / 65535.0
+                }
+                _ => continue,
+            };
+            render_to(voice, event.sample_offset as usize, buffer);
+            voice.trigger(velocity);
+        }
+        render_to(voice, n, buffer);
         ProcessStatus::Normal
     }
 
     fn editor(params: Arc<MireloVstRsParams>) -> Box<dyn Editor> {
-        truce_egui::EguiEditor::with_ui(params, (560, 400), mirelo::ui::MireloUi::default())
-            .into_editor()
+        editor::create(params)
     }
 }
 
